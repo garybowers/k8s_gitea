@@ -1,0 +1,168 @@
+---
+apiVersion: apps/v1beta2
+kind: Deployment
+metadata:
+  name: gitea
+  labels:
+    app: gitea
+  namespace: gitea
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gitea
+  template:
+    metadata:
+      labels:
+        app: gitea
+    spec:
+      restartPolicy: Always
+      containers:
+      - name: cloudsql-proxy
+        image: gcr.io/cloudsql-docker/gce-proxy:1.17
+        command: ["/cloud_sql_proxy",
+                  "-instances=core-769275:europe-west1:b1-svc-tooling-db-9f279145=tcp:3306",
+                  "-ip_address_types=PRIVATE",
+                  "-credential_file=/secrets/cloudsql/credentials.json"]
+        securityContext:
+          runAsUser: 2  # non-root user
+          allowPrivilegeEscalation: false
+        volumeMounts:
+          - name: cloudsql-instance-credentials
+            mountPath: /secrets/cloudsql
+            readOnly: true
+      - name: gitea
+        image: gcr.io/core-769275/gitea:0.28
+        ports:
+        - containerPort: 3000
+          name: tcp-gitea
+        - containerPort: 2222
+          name: tcp-gitea-ssh
+        env:
+        - name: DB_TYPE
+          value: mysql
+        - name: DB_HOST
+          value: localhost
+        - name: DB_NAME
+          value: gitea-prod
+        - name: DB_USER
+          value: gitea
+        - name: DB_PASSWD
+          value: password
+        - name: GITEA_WORK_DIR
+          value: /var/lib/gitea/
+        - name: INSTALL_LOCK
+          value: 'true'
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/gitea/data
+        - name: log
+          mountPath: /var/lib/gitea/log
+        - name: custom
+          mountPath: /var/lib/gitea/custom
+        - name: repos
+          mountPath: /var/lib/gitea/repos
+      volumes:
+        - name: cloudsql-instance-credentials
+          secret:
+            secretName: cloudsql-svc-acct
+        - name: data
+          nfs:
+            server: nfs-server.default.svc.cluster.local
+            path: /tooling/source/data
+        - name: custom
+          nfs:
+            server: nfs-server.default.svc.cluster.local
+            path: /tooling/source/custom
+        - name: log
+          nfs:
+            server: nfs-server.default.svc.cluster.local
+            path: /tooling/source/log
+        - name: repos
+          nfs:
+            server: nfs-server.default.svc.cluster.local
+            path: /tooling/source/repos
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gitea
+  namespace: gitea
+  labels:
+    app: gitea
+spec:
+  selector:
+    app: gitea
+  ports:
+  - name: tcp-gitea
+    port: 3000
+    protocol: TCP
+  - name: tcp-gitea-ssh
+    port: 2222
+    protocol: TCP
+---
+apiVersion: networking.istio.io/v1alpha3
+kind: Gateway
+metadata:
+  name: source-gateway
+  namespace: gitea
+spec:
+  selector:
+    istio: ingressgateway
+  servers:
+  - port:
+      number: 80
+      name: http-80-source
+      protocol: HTTP
+    hosts:
+    - "source.DOMAIN"
+    tls:
+      httpsRedirect: true
+  - port:
+      number: 443
+      name: https-443-source
+      protocol: HTTPS
+    hosts:
+    - "source.DOMAIN"
+    tls:
+      mode: SIMPLE # enables HTTPS on this port
+      serverCertificate: /etc/istio/ingressgateway-certs/tls.crt
+      privateKey: /etc/istio/ingressgateway-certs/tls.key
+---
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: source-vs-gitea
+  namespace: gitea
+spec:
+  gateways:
+  - source-gateway
+  hosts:
+  - source.DOMAIN
+  http:
+  - match:
+    - uri:
+        prefix: "/"
+    route:
+    - destination:
+        host: gitea.gitea.svc.cluster.local
+        port:
+          number: 3000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: elb-source-ssh
+  namespace: gitea
+  labels:
+    app: gitea
+spec:
+  type: LoadBalancer
+  loadBalancerIP: 0.0.0.0 #Create a static IP and assign the loadbalancer to that IP Address
+  ports:
+    - name: tcp-ssh
+      port: 22
+      targetPort: 2222
+      protocol: TCP
+  selector:
+    app: gitea
